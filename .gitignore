@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+*.h5
+*.tif
+*.tiff
+HH_tiles/
+HV_tiles/
