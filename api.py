@@ -2,15 +2,25 @@ import io
 import time
 import base64
 import zipfile
+import os
 import numpy as np
 import rasterio
 from rasterio.io import MemoryFile
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
+import tensorflow as tf
+from skimage.transform import resize
 
 app = Flask(__name__)
 CORS(app)
+
+MODEL_DIR = "d:/ISRO/Proj"
+print("Loading ML models...")
+unet_model = tf.keras.models.load_model(os.path.join(MODEL_DIR, "model_u-net_e04.h5"), compile=False, safe_mode=False)
+cnn_model = tf.keras.models.load_model(os.path.join(MODEL_DIR, "model_cnn_e04.h5"), compile=False, safe_mode=False)
+vision_model = tf.keras.models.load_model(os.path.join(MODEL_DIR, "model_vision_e04.h5"), compile=False, safe_mode=False)
+print("Models loaded successfully.")
 
 def get_band_config(band):
     configs = {
@@ -40,96 +50,119 @@ def np_to_base64(img_array):
 
 @app.route("/api/process", methods=["POST"])
 def process():
-    if 'file' not in request.files:
-        return jsonify({"error": "Missing SAR file archive"}), 400
-
     band = request.form.get("band", "L")
-    sar_file = request.files['file']
-    file_bytes = sar_file.read()
+    hh_input = request.form.get("hh_path")
+    hv_input = request.form.get("hv_path")
     
+    if not hh_input or not hv_input:
+        return jsonify({"error": "Missing HH or HV paths"}), 400
+
     t0 = time.time()
     
-    # 1. Unzip the file in memory
-    tif_files = {}
-    is_zip = sar_file.filename.lower().endswith('.zip')
-    
-    try:
-        if is_zip:
-            with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-                for filename in z.namelist():
-                    if filename.lower().endswith(('.tif', '.tiff')) and not filename.startswith('__MACOSX'):
-                        tif_files[filename] = z.read(filename)
-        else:
-            # Fallback if they uploaded a single TIF directly by accident
-            tif_files[sar_file.filename] = file_bytes
-    except Exception as e:
-        return jsonify({"error": "Failed to parse ZIP archive: " + str(e)}), 400
+    # Helper to resolve a path to a list of .tif files
+    def resolve_paths(input_path):
+        resolved = []
+        if os.path.isfile(input_path) and input_path.lower().endswith(('.tif', '.tiff')):
+            resolved.append(input_path)
+        elif os.path.isdir(input_path):
+            for f in os.listdir(input_path):
+                if f.lower().endswith(('.tif', '.tiff')):
+                    resolved.append(os.path.join(input_path, f))
+        return resolved
 
-    if not tif_files:
-        return jsonify({"error": "No .tif or .tiff files found inside the ZIP archive."}), 400
+    hh_paths = resolve_paths(hh_input)
+    hv_paths = resolve_paths(hv_input)
 
-    # 2. Extract HH and HV polarizations
-    hh_bytes = None
-    hv_bytes = None
-    
-    # Strategy A: If there are multiple TIF files in the zip, sort by HH/HV in filename
-    if len(tif_files) >= 2:
-        for fname, b in tif_files.items():
-            if 'hv' in fname.lower():
-                hv_bytes = b
-            elif 'hh' in fname.lower():
-                hh_bytes = b
+    if not hh_paths:
+        return jsonify({"error": f"No HH .tif files found at {hh_input}."}), 400
         
-        # Fallback if names aren't clear
-        if not hh_bytes: hh_bytes = list(tif_files.values())[0]
-        if not hv_bytes: hv_bytes = list(tif_files.values())[1]
-    else:
-        # Strategy B: Single TIF file (might contain multiple bands)
-        hh_bytes = list(tif_files.values())[0]
-        hv_bytes = list(tif_files.values())[0]
+    if not hv_paths:
+        hv_paths = hh_paths
 
     try:
-        # Load HH
-        with MemoryFile(hh_bytes) as memfile:
-            with memfile.open() as ds:
+        from rasterio.enums import Resampling
+        from rasterio.merge import merge
+        import rasterio
+
+        # Load or Stitch HH
+        if len(hh_paths) == 1:
+            with rasterio.open(hh_paths[0]) as ds:
                 profile = ds.profile
                 transform = ds.transform
                 crs = str(ds.crs) if ds.crs else "Not Defined"
                 bounds = ds.bounds
                 dtype = str(ds.dtypes[0])
                 band_count = ds.count
-                hh = ds.read(1).astype(np.float32)
                 
-                # If the single file actually has multiple bands, read band 2 as HV
-                if len(tif_files) == 1 and band_count >= 2:
-                    hv = ds.read(2).astype(np.float32)
-                    extracted_hv_from_band2 = True
+                scale = min(1024 / ds.height, 1024 / ds.width)
+                if scale >= 1:
+                    out_shape = (ds.height, ds.width)
                 else:
-                    extracted_hv_from_band2 = False
-        
-        # Load HV from separate file if needed
-        if len(tif_files) >= 2:
-            with MemoryFile(hv_bytes) as memfile:
-                with memfile.open() as ds:
-                    hv = ds.read(1).astype(np.float32)
-    except Exception as e:
-        return jsonify({"error": "Failed to read TIF tensors: " + str(e)}), 500
+                    out_shape = (int(ds.height * scale), int(ds.width * scale))
+                    
+                hh = ds.read(1, out_shape=out_shape, resampling=Resampling.nearest).astype(np.float32)
+                
+                extracted_hv_from_band2 = False
+                if band_count >= 2 and len(hv_paths) == 1 and hh_paths[0] == hv_paths[0]:
+                    hv = ds.read(2, out_shape=out_shape, resampling=Resampling.nearest).astype(np.float32)
+                    extracted_hv_from_band2 = True
+                    
+            if not extracted_hv_from_band2:
+                with rasterio.open(hv_paths[0]) as ds:
+                    hv = ds.read(1, out_shape=out_shape, resampling=Resampling.nearest).astype(np.float32)
+        else:
+            # Multiple tiles -> Mosaicking
+            hh_datasets = [rasterio.open(p) for p in hh_paths]
+            ds_0 = hh_datasets[0]
+            profile = ds_0.profile
+            crs = str(ds_0.crs) if ds_0.crs else "Not Defined"
+            dtype = str(ds_0.dtypes[0])
+            band_count = ds_0.count
+            
+            hh_mosaic, transform = merge(hh_datasets)
+            hh_array = hh_mosaic[0].astype(np.float32)
+            bounds = None
+            for ds in hh_datasets: ds.close()
+            
+            # Decimate in memory after mosaic
+            scale = min(1024 / hh_array.shape[0], 1024 / hh_array.shape[1])
+            if scale < 1:
+                out_shape = (int(hh_array.shape[0] * scale), int(hh_array.shape[1] * scale))
+                hh = resize(hh_array, out_shape, anti_aliasing=True, preserve_range=True).astype(np.float32)
+            else:
+                hh = hh_array
+                
+            extracted_hv_from_band2 = False
+            
+            # HV Mosaicking
+            hv_datasets = [rasterio.open(p) for p in hv_paths]
+            hv_mosaic, _ = merge(hv_datasets)
+            hv_array = hv_mosaic[0].astype(np.float32)
+            for ds in hv_datasets: ds.close()
+            
+            if scale < 1:
+                hv = resize(hv_array, out_shape, anti_aliasing=True, preserve_range=True).astype(np.float32)
+            else:
+                hv = hv_array
 
-    if hh.shape[0] > 1024 or hh.shape[1] > 1024:
-        hh = hh[:1024, :1024]
-        if 'hv' in locals(): hv = hv[:1024, :1024]
+    except Exception as e:
+        return jsonify({"error": "Failed to read or stitch TIF tensors: " + str(e)}), 500
+
+    # Sanitize NaNs which cause histogram crashes (e.g. from nodata regions)
+    hh = np.nan_to_num(hh, nan=1e-9)
+    hv = np.nan_to_num(hv, nan=1e-9)
 
     height, width = hh.shape
 
     # 3. Finalize polarizations (fallback synthesis if HV genuinely missing)
     np.random.seed(42)
-    if 'hv' not in locals() or (len(tif_files) == 1 and not extracted_hv_from_band2):
+    if 'hv' not in locals() or (len(hh_paths) == 1 and not extracted_hv_from_band2):
         hv = hh * 0.3 + (np.random.rand(height, width) * 10).astype(np.float32)
         synth_method = "hv = hh × 0.3 + 𝒩(0, 10)"
         synth_desc = "Missing HV polarization synthesized from HH."
     else:
-        synth_method = "Dual-polarization explicitly extracted from ZIP archive."
-        synth_desc = f"Extracted HH and HV arrays directly from {len(tif_files)} physical TIF file(s)."
+        synth_method = "Dual-polarization explicitly extracted from local paths."
+        synth_desc = f"Extracted HH and HV arrays directly from {len(hh_paths)} physical TIF file(s)."
         # Ensure dimensions match if they came from different files
         if hh.shape != hv.shape:
             min_h = min(hh.shape[0], hv.shape[0])
@@ -163,7 +196,7 @@ def process():
     stretched = stretch(composite_db, lower, upper)
 
     # --- Stage 3: K-Means Threshold Mask ---
-    db_img = composite_db
+    db_img = 10 * np.log10(np.where(stretched > 0, stretched, 1e-9))
     mask = np.zeros((height, width, 3), dtype=np.uint8)
     water_mask   = db_img <= config["w"]
     land_mask    = (db_img > config["w"]) & (db_img <= config["l"])
@@ -174,6 +207,75 @@ def process():
     mask[land_mask]   = [39,  174, 96]
     mask[crop_mask]   = [243, 156, 18]
     mask[mtn_mask]    = [192, 57,  43]
+
+    # --- Stage 4: ML Models Inference ---
+    # Replicate train_unet.py preprocessing EXACTLY to fix misclassifications
+    ratio_raw = hh / np.where(hv <= 0, 1e-9, hv)
+    diff_raw = hh - hv
+    hv_raw = np.where(hv <= 0, 1e-9, hv)
+    
+    ratio_db_ml = 10 * np.log10(np.where(ratio_raw <= 0, 1e-9, ratio_raw))
+    diff_db_ml  = 10 * np.log10(np.where(diff_raw <= 0, 1e-9, diff_raw))
+    hv_db_ml    = 10 * np.log10(hv_raw)
+    
+    # The loaded models are _e04.h5 (C-band), which were trained with stretch bounds -20.0 and 5.0
+    ratio_str = stretch(ratio_db_ml, -20.0, 5.0)
+    diff_str  = stretch(diff_db_ml, -20.0, 5.0)
+    hv_str_ml = stretch(hv_db_ml, -20.0, 5.0)
+    
+    # Calculate composite (0-255)
+    gray_composite_ml = 0.33 * hv_str_ml + 0.33 * ratio_str + 0.33 * diff_str
+    
+    # 1. High-Resolution Patch-Based Inference (U-Net & CNN)
+    def get_fcn_mask(model, composite_img, out_h, out_w):
+        patch_size = 256
+        c_mask = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        
+        # Pad image to be a multiple of patch_size
+        pad_h = (patch_size - out_h % patch_size) % patch_size
+        pad_w = (patch_size - out_w % patch_size) % patch_size
+        padded_img = np.pad(composite_img, ((0, pad_h), (0, pad_w)), mode='reflect')
+        
+        for y in range(0, padded_img.shape[0], patch_size):
+            for x in range(0, padded_img.shape[1], patch_size):
+                patch = padded_img[y:y+patch_size, x:x+patch_size]
+                patch_tensor = np.expand_dims(patch, axis=(0, -1))
+                
+                pred_prob = model.predict(patch_tensor, verbose=0)
+                pred_class = np.argmax(pred_prob, axis=-1)[0]
+                
+                p_mask = np.zeros((patch_size, patch_size, 3), dtype=np.uint8)
+                p_mask[pred_class == 0] = [41,  128, 185] # Water
+                p_mask[pred_class == 1] = [39,  174, 96]  # Land
+                p_mask[pred_class == 2] = [243, 156, 18]  # Crop
+                p_mask[pred_class == 3] = [192, 57,  43]  # Mountain
+                
+                valid_h = min(patch_size, out_h - y)
+                valid_w = min(patch_size, out_w - x)
+                
+                if valid_h > 0 and valid_w > 0:
+                    c_mask[y:y+valid_h, x:x+valid_w] = p_mask[:valid_h, :valid_w]
+                    
+        return c_mask
+
+    unet_mask = get_fcn_mask(unet_model, gray_composite_ml, height, width)
+    cnn_mask = get_fcn_mask(cnn_model, gray_composite_ml, height, width)
+    
+    # 2. Vision Transformer processing - requires exactly 256x256
+    vit_composite = resize(gray_composite_ml, (256, 256), anti_aliasing=True, mode='reflect', preserve_range=True)
+    vit_tensor = np.expand_dims(vit_composite, axis=(0, -1))
+    
+    vit_prob = vision_model.predict(vit_tensor, verbose=0)
+    vit_class = np.argmax(vit_prob, axis=-1)[0]
+    
+    v_mask = np.zeros((256, 256, 3), dtype=np.uint8)
+    v_mask[vit_class == 0] = [41,  128, 185]
+    v_mask[vit_class == 1] = [39,  174, 96]
+    v_mask[vit_class == 2] = [243, 156, 18]
+    v_mask[vit_class == 3] = [192, 57,  43]
+    
+    vision_mask = resize(v_mask, (height, width), order=0, preserve_range=True, anti_aliasing=False).astype(np.uint8)
+
 
     process_ms = int((time.time() - t0) * 1000)
     total_px = height * width
@@ -203,11 +305,14 @@ def process():
         "images": {
             "raw":      np_to_base64(raw_vis),
             "stretched": np_to_base64(stretched),
-            "mask":     np_to_base64(mask)
+            "mask":     np_to_base64(mask),
+            "unet":     np_to_base64(unet_mask),
+            "cnn":      np_to_base64(cnn_mask),
+            "vision":   np_to_base64(vision_mask)
         },
         "file_metadata": {
-            "filename":    sar_file.filename,
-            "size_mb":     round(len(file_bytes) / (1024 * 1024), 3),
+            "filename":    "Mosaicked" if len(hh_paths) > 1 else os.path.basename(hh_paths[0]),
+            "size_mb":     round(sum(os.path.getsize(p) for p in hh_paths + hv_paths) / (1024 * 1024), 3),
             "dtype":       dtype,
             "band_count":  band_count,
             "resolution":  str(width) + " x " + str(height),

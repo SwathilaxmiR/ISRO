@@ -124,69 +124,90 @@ def main():
     hh_folder = 'D:/ISRO/Proj/E04_HH_tiles'   # C-band HH polarization tiles
     hv_folder = 'D:/ISRO/Proj/E04_HV_tiles'   # C-band HV polarization tiles
 
-    hh_files = os.listdir(hh_folder)
-    hv_files = os.listdir(hv_folder)
-    
+    # FIX 1: Sort files so os.listdir() order differences don't cause mismatches.
+    # aoi_sub_e04.py names tiles as tile_r{row}_c{col}.tif for both HH and HV,
+    # so sorting guarantees the i-th HH file always matches the i-th HV file.
+    hh_files = sorted([f for f in os.listdir(hh_folder) if f.endswith(('.tif', '.tiff'))])
+    hv_files = sorted([f for f in os.listdir(hv_folder) if f.endswith(('.tif', '.tiff'))])
+
+    # Build a name-lookup set for HV so we can verify the matching tile exists
+    hv_name_set = set(hv_files)
+
     X = []
     y = []
-    
+
     print("Step 1: Loading images and calculating overall image classes...")
-    
+    print(f"  Found {len(hh_files)} HH tiles, {len(hv_files)} HV tiles.")
+
     # Process up to 50 images for speed (increase if you want to use the full dataset)
     max_images = min(50, len(hh_files))
-    
+
     for i in range(max_images):
         hh_file = hh_files[i]
-        hv_file = hv_files[i]
-        
-        if not hh_file.endswith(('.tif', '.tiff')):
+
+        if hh_file not in hv_name_set:
+            # Skip if the matching HV tile does not exist (e.g. edge tiles dropped)
+            print(f"  [SKIP] No matching HV tile for {hh_file}")
             continue
-            
+
         hh_tif_file = os.path.join(hh_folder, hh_file)
-        hv_tif_file = os.path.join(hv_folder, hv_file)
-        
-        if not os.path.exists(hv_tif_file):
-            continue
-            
+        hv_tif_file = os.path.join(hv_folder, hh_file)  # same filename, different folder
+
         with rasterio.open(hh_tif_file) as hh_ds:
-            hh_data = hh_ds.read(1)
+            hh_data      = hh_ds.read(1).astype(np.float32)
             hh_transform = hh_ds.transform
-            hh_crs = hh_ds.crs
-    
+            hh_crs       = hh_ds.crs
+
         with rasterio.open(hv_tif_file) as hv_ds:
-            hv_data = hv_ds.read(1)
+            hv_data      = hv_ds.read(1).astype(np.float32)
             hv_transform = hv_ds.transform
-            hv_crs = hv_ds.crs
-            
+            hv_crs       = hv_ds.crs
+
         hv_data_resized = resize_hv_data(hv_data, hv_transform, hh_transform, hh_data.shape, hv_crs, hh_crs)
         hv_data_resized[hv_data_resized <= 0] = 1e-9
-    
+        hh_data[hh_data <= 0] = 1e-9
+
         hh_hv_ratio = hh_data / hv_data_resized
-        hh_hv_diff  = hh_data - hv_data_resized
-    
+
+        # FIX 2: Compute difference in dB scale (not linear).
+        # Subtracting raw linear SAR values is physically meaningless because
+        # backscatter intensity is log-normally distributed. Converting to dB
+        # first gives a meaningful contrast feature for land-cover separation.
+        # abs() ensures the value is positive so log10 is safe.
+        hh_db = 10 * np.log10(hh_data)
+        hv_db = 10 * np.log10(hv_data_resized)
+        hh_hv_diff_linear = np.abs(hh_db - hv_db)          # dB difference, always >= 0
+        hh_hv_diff_linear[hh_hv_diff_linear <= 0] = 1e-9   # guard before re-stretching
+
         # CHANGE 4: Use C-band stretch range (C_LOWER, C_UPPER) instead of
-        # L-band values (-7, 3.5). Using the wrong range clips C-band pixel
-        # values and removes the feature variation that SVM/MLP rely on.
-        hh_hv_ratio_db = convert_to_db_and_stretch(hh_hv_ratio,    C_LOWER, C_UPPER)  # was: (-7, 3.5)
-        hh_hv_diff_db  = convert_to_db_and_stretch(hh_hv_diff,     C_LOWER, C_UPPER)  # was: (-7, 3.5)
-        hv             = convert_to_db_and_stretch(hv_data_resized, C_LOWER, C_UPPER)  # was: (-7, 3.5)
-    
-        gray_composite = 0.33*hv + 0.33 * hh_hv_ratio_db + 0.33 * hh_hv_diff_db
-        
+        # L-band values (-7, 3.5). Run find_thresholds_e04.py to get these.
+        hh_hv_ratio_db = convert_to_db_and_stretch(hh_hv_ratio,        C_LOWER, C_UPPER)
+        hh_hv_diff_db  = convert_to_db_and_stretch(hh_hv_diff_linear,  C_LOWER, C_UPPER)
+        hv_stretched   = convert_to_db_and_stretch(hv_data_resized,    C_LOWER, C_UPPER)
+
+        gray_composite = 0.33 * hv_stretched + 0.33 * hh_hv_ratio_db + 0.33 * hh_hv_diff_db
+
         # Resize to 150x150 as defined in the Stacking Notebook
         image_150 = resize(gray_composite, (150, 150), anti_aliasing=True, mode='reflect')
-        
-        # Calculate overall mean db value and map to label using C-band thresholds
+
+        # Calculate overall mean dB value and map to label using C-band thresholds
         db_image = convert_to_db(image_150)
         mean_db  = np.nanmean(db_image)
-        
+
         label = map_backscatter_to_label(mean_db)
-        
+
         X.append(image_150)
         y.append(label)
-        
-        if (i+1) % 10 == 0:
-            print(f"Processed {i+1}/{max_images} images")
+
+        if (i + 1) % 10 == 0:
+            print(f"  Processed {i+1}/{max_images} images")
+
+    # FIX 3: Guard against an empty dataset before training
+    if len(X) == 0:
+        raise RuntimeError(
+            "No valid image pairs found. Check that E04_HH_tiles and E04_HV_tiles "
+            "exist and contain matching tile_r*_c*.tif files (run aoi_sub_e04.py first)."
+        )
 
     X = np.array(X)
     y = np.array(y)

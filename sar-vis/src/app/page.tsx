@@ -23,7 +23,7 @@ type Classification = {
 };
 type QualityMetrics = { snr: number; entropy_bits: number; process_ms: number; dynamic_range_db: number };
 type ProcessData = {
-  images: { raw: string; stretched: string; mask: string };
+  images: { raw: string; stretched: string; mask: string; unet: string; cnn: string; vision: string };
   file_metadata: FileMetadata;
   raw_array_stats: ArrayStats;
   db_stats: DbStats;
@@ -44,19 +44,20 @@ const CLASSES = [
 ] as const;
 
 export default function Home() {
-  const [band, setBand]               = useState<"L" | "C" | "S">("L");
-  const [file, setFile]               = useState<File | null>(null);
+  const [band, setBand]               = useState<"L" | "C" | "S">("C");
+  const [hhPath, setHhPath]           = useState<string>("d:\\ISRO\\Proj\\E04_HH_tiles");
+  const [hvPath, setHvPath]           = useState<string>("d:\\ISRO\\Proj\\E04_HV_tiles");
   const [state, setState]             = useState<"IDLE" | "PROCESSING" | "COMPLETE">("IDLE");
   const [data, setData]               = useState<ProcessData | null>(null);
   const [error, setError]             = useState("");
-  const [tab, setTab]                 = useState<"RAW" | "STRETCHED" | "MASK">("RAW");
-  const fileRef                       = useRef<HTMLInputElement>(null);
+  const [tab, setTab]                 = useState<"RAW" | "STRETCHED" | "MASK" | "UNET" | "CNN" | "VISION">("RAW");
 
   const run = async () => {
-    if (!file) { setError("No file selected."); return; }
+    if (!hhPath || !hvPath) { setError("Both HH and HV paths must be provided."); return; }
     setError(""); setState("PROCESSING");
     const fd = new FormData();
-    fd.append("file", file);
+    fd.append("hh_path", hhPath);
+    fd.append("hv_path", hvPath);
     fd.append("band", band);
     try {
       const res  = await fetch("http://localhost:5000/api/process", { method: "POST", body: fd });
@@ -85,7 +86,17 @@ export default function Home() {
           <span className="status-txt">Engine Ready</span>
           <div className="band-toggle">
             {(["L","C","S"] as const).map(b => (
-              <button key={b} onClick={() => { setBand(b); reset(); }}
+              <button key={b} onClick={() => { 
+                setBand(b); 
+                if (b === "C") {
+                  setHhPath("d:\\ISRO\\Proj\\E04_HH_tiles");
+                  setHvPath("d:\\ISRO\\Proj\\E04_HV_tiles");
+                } else if (b === "L") {
+                  setHhPath("d:\\ISRO\\Proj\\HH.tif");
+                  setHvPath("d:\\ISRO\\Proj\\HV.tif");
+                }
+                reset(); 
+              }}
                 className={b === band ? "band-btn active" : "band-btn"}>
                 {b}-Band
               </button>
@@ -102,18 +113,31 @@ export default function Home() {
 
           {/* Upload */}
           <section className="card">
-            <div className="card-header">DATASET INGESTION</div>
-            <div className="upload-zone" onClick={() => fileRef.current?.click()}>
-              <div className="upload-icon">{file ? "✔" : "⊕"}</div>
-              <p className="upload-name">{file ? file.name : "Select ZIP Archive (.zip)"}</p>
-              <p className="upload-hint">
-                {file ? ((file.size / 1048576).toFixed(2) + " MB") : "Backend extracts TIFs from archive automatically"}
-              </p>
-              <input ref={fileRef} type="file" accept=".zip,.tif,.tiff" style={{ display: "none" }}
-                onChange={e => { if (e.target.files?.[0]) { setFile(e.target.files[0]); e.target.value = ""; } }} />
+            <div className="card-header">DIRECT DISK INGESTION</div>
+            <div style={{ padding: "15px" }}>
+              <label style={{ display: "block", marginBottom: "10px", fontSize: "0.9rem", color: "#ccc" }}>
+                <strong>Absolute HH Path:</strong>
+                <input 
+                  type="text" 
+                  value={hhPath} 
+                  onChange={(e) => setHhPath(e.target.value)} 
+                  placeholder="e.g. D:\ISRO\Proj\HH.tif or D:\ISRO\Proj\E04_HH_tiles"
+                  style={{ width: "100%", padding: "10px", marginTop: "5px", background: "#1a1a1a", color: "white", border: "1px solid #333", borderRadius: "6px", fontFamily: "monospace" }} 
+                />
+              </label>
+              <label style={{ display: "block", marginBottom: "15px", fontSize: "0.9rem", color: "#ccc" }}>
+                <strong>Absolute HV Path:</strong>
+                <input 
+                  type="text" 
+                  value={hvPath} 
+                  onChange={(e) => setHvPath(e.target.value)} 
+                  placeholder="e.g. D:\ISRO\Proj\HV.tif or D:\ISRO\Proj\E04_HV_tiles"
+                  style={{ width: "100%", padding: "10px", marginTop: "5px", background: "#1a1a1a", color: "white", border: "1px solid #333", borderRadius: "6px", fontFamily: "monospace" }} 
+                />
+              </label>
             </div>
             <button className={state === "PROCESSING" ? "run-btn running" : "run-btn"}
-              onClick={run} disabled={state === "PROCESSING" || !file}>
+              onClick={run} disabled={state === "PROCESSING" || !hhPath || !hvPath}>
               {state === "PROCESSING" ? <><span className="spinner"></span> Processing…</> : "▶  Run Pipeline"}
             </button>
             {data && <button className="reset-btn" onClick={reset}>↺  Reset</button>}
@@ -184,19 +208,33 @@ export default function Home() {
               {/* Image Viewer */}
               <section className="card canvas-card">
                 <div className="tab-bar">
-                  {(["RAW","STRETCHED","MASK"] as const).map(t => (
+                  {(["RAW","STRETCHED","MASK","UNET","CNN","VISION"] as const).map(t => (
                     <button key={t} onClick={() => setTab(t)}
                       className={tab === t ? "tab active" : "tab"}>
-                      {t === "RAW" ? "01  Raw " + (data.synth?.raw_label || "HH") + " Array" : t === "STRETCHED" ? "02  dB Composite" : "03  Classification Mask"}
+                      {t === "RAW" ? "01 Raw " + (data.synth?.raw_label || "HH") : 
+                       t === "STRETCHED" ? "02 Composite" : 
+                       t === "MASK" ? "03 K-Means" :
+                       t === "UNET" ? "04 U-Net" :
+                       t === "CNN" ? "05 CNN" : "06 Vision"}
                     </button>
                   ))}
                 </div>
                 <div className="image-stage">
                   <img key={tab} className="sar-img" alt={tab}
-                    src={tab === "RAW" ? data.images.raw : tab === "STRETCHED" ? data.images.stretched : data.images.mask} />
+                    src={tab === "RAW" ? data.images.raw : 
+                         tab === "STRETCHED" ? data.images.stretched : 
+                         tab === "MASK" ? data.images.mask :
+                         tab === "UNET" ? data.images.unet :
+                         tab === "CNN" ? data.images.cnn :
+                         data.images.vision} />
                   <div className="img-overlay">
                     <span>{data.file_metadata.resolution} px · {band}-Band</span>
-                    <span>{tab === "RAW" ? "Linear amplitude stretch" : tab === "STRETCHED" ? "10·log₁₀(σ) composite" : "Threshold K-means segmentation"}</span>
+                    <span>{tab === "RAW" ? "Linear amplitude stretch" : 
+                           tab === "STRETCHED" ? "10·log₁₀(σ) composite" : 
+                           tab === "MASK" ? "Threshold K-means segmentation" :
+                           tab === "UNET" ? "U-Net Semantic Segmentation" :
+                           tab === "CNN" ? "FCN-CNN Semantic Segmentation" :
+                           "Vision Transformer Segmentation"}</span>
                   </div>
                 </div>
               </section>
@@ -453,6 +491,7 @@ const CSS = `
   border: 1px solid #1a1a1a;
   border-radius: 8px;
   overflow: hidden;
+  flex-shrink: 0;
 }
 .card-header {
   padding: 10px 16px;

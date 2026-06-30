@@ -169,9 +169,11 @@ def main():
 
         hv_r = resize_hv_data(hv_data, hv_transform, hh_transform, hh_data.shape, hv_crs, hh_crs)
         hv_r[hv_r <= 0] = 1e-9
+        hh_data[hh_data <= 0] = 1e-9
 
         ratio = hh_data / hv_r
-        diff  = hh_data - hv_r
+        diff  = np.abs(hh_data - hv_r)
+        diff[diff <= 0] = 1e-9
 
         # Use the C-band derived stretch range (NOT the L-band -7 / 3.5)
         hh_hv_ratio_db = convert_to_db_and_stretch(ratio,  c_lower, c_upper)
@@ -185,8 +187,8 @@ def main():
         min_val = np.nanmin(db_image) if len(db_image[~np.isnan(db_image)]) > 0 else 0
         db_image[np.isnan(db_image)] = min_val
         finite_pixels = db_image[np.isfinite(db_image)]
-        if len(finite_pixels) > 0:
-            db_image[np.isinf(db_image)] = np.nanmax(finite_pixels) + 1
+        finite_max = np.nanmax(finite_pixels) if len(finite_pixels) > 0 else 0
+        db_image[np.isinf(db_image)] = finite_max + 1
 
         all_db_pixels.extend(db_image.flatten())
 
